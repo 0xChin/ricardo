@@ -69,8 +69,7 @@ async function transcribeAudio(wavFilePath, jsonFilePath, username) {
     const transcription = await openai.audio.transcriptions.create({
       file: createReadStream(wavFilePath),
       model: 'gpt-4o-mini-transcribe',
-      response_format: 'json',
-      language: 'es' // Set to Spanish, change to 'en' for English or remove for auto-detection
+      response_format: 'json'
     });
 
     const transcriptionData = {

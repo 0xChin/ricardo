@@ -4,12 +4,19 @@ import { Client, GatewayIntentBits } from 'discord.js';
 import { joinVoiceChannel, VoiceConnectionStatus } from '@discordjs/voice';
 import Prism from 'prism-media';
 import { createWriteStream } from 'fs';
+import { unlink } from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import wav from 'wav';
+import ffmpeg from 'fluent-ffmpeg';
+import ffmpegStatic from 'ffmpeg-static';
 
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Configure ffmpeg
+ffmpeg.setFfmpegPath(ffmpegStatic);
 
 const client = new Client({
   intents: [
@@ -23,6 +30,33 @@ const client = new Client({
 let connection;
 const userStreams = new Map();
 const endTimers = new Map(); // Track end timers to debounce end events
+
+// Function to convert PCM to WAV
+async function convertPcmToWav(pcmFilePath, wavFilePath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(pcmFilePath)
+      .inputFormat('s16le') // 16-bit signed little-endian PCM
+      .inputOptions([
+        '-ar 48000', // Sample rate 48kHz
+        '-ac 2'      // 2 channels (stereo)
+      ])
+      .output(wavFilePath)
+      .audioCodec('pcm_s16le')
+      .format('wav')
+      .on('end', () => {
+        console.log(`[CONVERT] Successfully converted ${pcmFilePath} to ${wavFilePath}`);
+        // Delete the PCM file after conversion
+        unlink(pcmFilePath).catch(err => console.error(`Error deleting PCM file: ${err}`));
+        resolve();
+      })
+      .on('error', (err) => {
+        console.error(`[CONVERT] Error converting ${pcmFilePath}:`, err);
+        reject(err);
+      })
+      .run();
+  });
+}
 
 client.once('ready', () => {
   console.log(`Conectado como ${client.user.tag}`);
@@ -61,6 +95,7 @@ client.on('messageCreate', async (message) => {
         const user = await client.users.fetch(userId);
         const timestamp = Date.now();
         const filename = path.join(__dirname, `audio_${userId}_${timestamp}.pcm`);
+        const wavFilename = path.join(__dirname, `audio_${userId}_${timestamp}.wav`);
         const writeStream = createWriteStream(filename);
 
         // Use longer silence duration (10 seconds) to prevent premature ending
@@ -74,7 +109,9 @@ client.on('messageCreate', async (message) => {
           writeStream, 
           opusStream,
           user: user.username,
-          startTime: timestamp
+          startTime: timestamp,
+          pcmFilename: filename,
+          wavFilename: wavFilename
         });
         
         console.log(`[START] Recording started for user ${user.username} (${userId})`);
@@ -133,6 +170,15 @@ client.on('messageCreate', async (message) => {
           
           console.log(`[END] Recording ended for user ${user.username} (${userId}) - Duration: ${duration}ms`);
           textChannel.send(`⏹️ Dejó de hablar: **${user.username}**`);
+
+          // Convert PCM to WAV
+          try {
+            await convertPcmToWav(currentInfo.pcmFilename, currentInfo.wavFilename);
+            textChannel.send(`🎵 Audio guardado: **${path.basename(currentInfo.wavFilename)}**`);
+          } catch (convertError) {
+            console.error(`[CONVERT] Failed to convert audio for ${user.username}:`, convertError);
+            textChannel.send(`❌ Error al convertir audio de **${user.username}**`);
+          }
         } catch (error) {
           console.error(`[END] Error ending recording for user ${userId}:`, error);
           // Force cleanup even if there was an error

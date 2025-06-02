@@ -221,16 +221,16 @@ client.on('messageCreate', async (message) => {
           return;
         }
 
-        // Implement debounced ending - wait 6 seconds before actually ending
+        // Implement debounced ending - wait 3 seconds before actually ending
         // This prevents premature ending during brief pauses in speech
-        console.log(`[END] End event received for user ${info.user} (${userId}), setting 6s delay before stopping`);
+        console.log(`[END] End event received for user ${info.user} (${userId}), setting 3s delay before stopping`);
         
         // Clear any existing timer
         if (endTimers.has(userId)) {
           clearTimeout(endTimers.get(userId));
         }
 
-        // Set a timer to actually end the recording after 6 seconds
+        // Set a timer to actually end the recording after 3 seconds
         const endTimer = setTimeout(async () => {
           // Double-check the user is still in userStreams (might have restarted)
           const currentInfo = userStreams.get(userId);
@@ -287,7 +287,7 @@ client.on('messageCreate', async (message) => {
             userStreams.delete(userId);
             endTimers.delete(userId);
           }
-        }, 6000); // 6 second delay
+        }, 3000); // 3 second delay
 
         endTimers.set(userId, endTimer);
       });

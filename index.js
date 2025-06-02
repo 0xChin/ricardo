@@ -4,12 +4,13 @@ import { Client, GatewayIntentBits } from 'discord.js';
 import { joinVoiceChannel, VoiceConnectionStatus } from '@discordjs/voice';
 import Prism from 'prism-media';
 import { createWriteStream } from 'fs';
-import { unlink } from 'fs/promises';
+import { unlink, writeFile } from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import wav from 'wav';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
+import OpenAI from 'openai';
+import { createReadStream } from 'fs';
 
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
@@ -18,13 +19,9 @@ const __dirname = path.dirname(__filename);
 // Configure ffmpeg
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
+// Configure OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
 });
 
 let connection;
@@ -57,6 +54,54 @@ async function convertPcmToWav(pcmFilePath, wavFilePath) {
       .run();
   });
 }
+
+// Function to transcribe audio using Whisper
+async function transcribeAudio(wavFilePath, jsonFilePath, username) {
+  try {
+    console.log(`[WHISPER] Starting transcription for ${username}...`);
+    
+    // Polyfill for Node 18 compatibility with OpenAI library
+    if (!globalThis.File) {
+      const { File } = await import('node:buffer');
+      globalThis.File = File;
+    }
+    
+    const transcription = await openai.audio.transcriptions.create({
+      file: createReadStream(wavFilePath),
+      model: 'gpt-4o-mini-transcribe',
+      response_format: 'json',
+      language: 'es' // Set to Spanish, change to 'en' for English or remove for auto-detection
+    });
+
+    const transcriptionData = {
+      user: username,
+      timestamp: new Date().toISOString(),
+      duration: transcription.duration,
+      text: transcription.text,
+      segments: transcription.segments,
+      language: transcription.language,
+      audioFile: path.basename(wavFilePath)
+    };
+
+    // Save transcription as JSON
+    await writeFile(jsonFilePath, JSON.stringify(transcriptionData, null, 2));
+    
+    console.log(`[WHISPER] Transcription completed for ${username}`);
+    return transcriptionData;
+  } catch (error) {
+    console.error(`[WHISPER] Error transcribing audio for ${username}:`, error);
+    throw error;
+  }
+}
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
+});
 
 client.once('ready', () => {
   console.log(`Conectado como ${client.user.tag}`);
@@ -96,10 +141,11 @@ client.on('messageCreate', async (message) => {
         const timestamp = Date.now();
         const filename = path.join(__dirname, `audio_${userId}_${timestamp}.pcm`);
         const wavFilename = path.join(__dirname, `audio_${userId}_${timestamp}.wav`);
+        const jsonFilename = path.join(__dirname, `transcription_${userId}_${timestamp}.json`);
         const writeStream = createWriteStream(filename);
 
-        // Use longer silence duration (10 seconds) to prevent premature ending
-        const opusStream = receiver.subscribe(userId, { end: { behavior: 'silence', duration: 10000 } });
+        // Use longer silence duration (30 seconds) to prevent premature ending
+        const opusStream = receiver.subscribe(userId, { end: { behavior: 'silence', duration: 30000 } });
         const decoder = new Prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
         const pcmStream = opusStream.pipe(decoder);
         pcmStream.pipe(writeStream);
@@ -111,7 +157,8 @@ client.on('messageCreate', async (message) => {
           user: user.username,
           startTime: timestamp,
           pcmFilename: filename,
-          wavFilename: wavFilename
+          wavFilename: wavFilename,
+          jsonFilename: jsonFilename
         });
         
         console.log(`[START] Recording started for user ${user.username} (${userId})`);
@@ -133,16 +180,16 @@ client.on('messageCreate', async (message) => {
         return;
       }
 
-      // Implement debounced ending - wait 2 seconds before actually ending
+      // Implement debounced ending - wait 6 seconds before actually ending
       // This prevents premature ending during brief pauses in speech
-      console.log(`[END] End event received for user ${info.user} (${userId}), setting 2s delay before stopping`);
+      console.log(`[END] End event received for user ${info.user} (${userId}), setting 6s delay before stopping`);
       
       // Clear any existing timer
       if (endTimers.has(userId)) {
         clearTimeout(endTimers.get(userId));
       }
 
-      // Set a timer to actually end the recording after 2 seconds
+      // Set a timer to actually end the recording after 6 seconds
       const endTimer = setTimeout(async () => {
         // Double-check the user is still in userStreams (might have restarted)
         const currentInfo = userStreams.get(userId);
@@ -175,6 +222,21 @@ client.on('messageCreate', async (message) => {
           try {
             await convertPcmToWav(currentInfo.pcmFilename, currentInfo.wavFilename);
             textChannel.send(`🎵 Audio guardado: **${path.basename(currentInfo.wavFilename)}**`);
+            
+            // Transcribe audio using Whisper
+            try {
+              const transcriptionData = await transcribeAudio(
+                currentInfo.wavFilename, 
+                currentInfo.jsonFilename, 
+                user.username
+              );
+              
+              textChannel.send(`📝 Transcripción completada: **${transcriptionData.text.substring(0, 100)}${transcriptionData.text.length > 100 ? '...' : ''}**`);
+              console.log(`[WHISPER] Full transcription saved to: ${path.basename(currentInfo.jsonFilename)}`);
+            } catch (transcriptionError) {
+              console.error(`[WHISPER] Failed to transcribe audio for ${user.username}:`, transcriptionError);
+              textChannel.send(`❌ Error en transcripción de **${user.username}**: ${transcriptionError.message}`);
+            }
           } catch (convertError) {
             console.error(`[CONVERT] Failed to convert audio for ${user.username}:`, convertError);
             textChannel.send(`❌ Error al convertir audio de **${user.username}**`);
@@ -185,7 +247,7 @@ client.on('messageCreate', async (message) => {
           userStreams.delete(userId);
           endTimers.delete(userId);
         }
-      }, 2000); // 2 second delay
+      }, 6000); // 6 second delay
 
       endTimers.set(userId, endTimer);
     });

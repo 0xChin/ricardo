@@ -285,17 +285,17 @@ client.on('interactionCreate', async (interaction) => {
       receiver.speaking.on('start', async (userId) => {
         if (!isRecording) return;
         
-        // Check if user is already being recorded
-        if (userStreams.has(userId)) {
-          console.log(`[START] User ${userId} is already being recorded, ignoring duplicate start event`);
-          return;
-        }
-
-        // Cancel any pending end timer for this user
+        // Cancel any pending end timer for this user (if they started speaking again)
         if (endTimers.has(userId)) {
           clearTimeout(endTimers.get(userId));
           endTimers.delete(userId);
-          console.log(`[START] Cancelled pending end timer for user ${userId}`);
+          console.log(`[START] Cancelled pending end timer for user ${userId} - user started speaking again`);
+        }
+
+        // Check if user is already being recorded
+        if (userStreams.has(userId)) {
+          console.log(`[START] User ${userId} is already being recorded, continuing existing stream`);
+          return;
         }
 
         try {
@@ -343,9 +343,9 @@ client.on('interactionCreate', async (interaction) => {
           return;
         }
 
-        // Implement debounced ending - wait 3 seconds before actually ending
-        // This prevents premature ending during brief pauses in speech
-        console.log(`[END] End event received for user ${info.user} (${userId}), setting 3s delay before stopping`);
+        // Implement debounced ending - wait 1 second before actually ending
+        // This prevents premature ending during brief pauses and accounts for user lag
+        console.log(`[END] End event received for user ${info.user} (${userId}), setting 1s delay before stopping`);
         
         // Clear any existing timer
         if (endTimers.has(userId)) {
@@ -380,36 +380,39 @@ client.on('interactionCreate', async (interaction) => {
             
             console.log(`[END] Recording ended for user ${user.username} (${userId}) - Duration: ${duration}ms`);
 
-            // Convert PCM to WAV
-            try {
-              await convertPcmToWav(currentInfo.pcmFilename, currentInfo.wavFilename);
-              console.log(`[CONVERT] Audio converted: ${path.basename(currentInfo.wavFilename)}`);
-              
-              // Transcribe audio using Whisper and add to session
+            // Convert PCM to WAV and transcribe asynchronously (non-blocking)
+            // This allows the bot to continue listening while processing previous audio
+            setImmediate(async () => {
               try {
-                const transcriptionEntry = await transcribeAndAddToSession(
-                  currentInfo.wavFilename, 
-                  user.username,
-                  recordingSession
-                );
+                await convertPcmToWav(currentInfo.pcmFilename, currentInfo.wavFilename);
+                console.log(`[CONVERT] Audio converted: ${path.basename(currentInfo.wavFilename)}`);
                 
-                console.log(`[TRANSCRIPTION] ${user.username}: "${transcriptionEntry.text}"`);
-                
-                // Save updated session data
-                await saveSessionToJson(recordingSession);
-              } catch (transcriptionError) {
-                console.error(`[WHISPER] Failed to transcribe audio for ${user.username}:`, transcriptionError);
+                // Transcribe audio using Whisper and add to session
+                try {
+                  const transcriptionEntry = await transcribeAndAddToSession(
+                    currentInfo.wavFilename, 
+                    user.username,
+                    recordingSession
+                  );
+                  
+                  console.log(`[TRANSCRIPTION] ${user.username}: "${transcriptionEntry.text}"`);
+                  
+                  // Save updated session data
+                  await saveSessionToJson(recordingSession);
+                } catch (transcriptionError) {
+                  console.error(`[WHISPER] Failed to transcribe audio for ${user.username}:`, transcriptionError);
+                }
+              } catch (convertError) {
+                console.error(`[CONVERT] Failed to convert audio for ${user.username}:`, convertError);
               }
-            } catch (convertError) {
-              console.error(`[CONVERT] Failed to convert audio for ${user.username}:`, convertError);
-            }
+            });
           } catch (error) {
             console.error(`[END] Error ending recording for user ${userId}:`, error);
             // Force cleanup even if there was an error
             userStreams.delete(userId);
             endTimers.delete(userId);
           }
-        }, 3000); // 3 second delay
+        }, 1000); // 1 second delay
 
         endTimers.set(userId, endTimer);
       });

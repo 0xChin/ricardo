@@ -4,7 +4,7 @@ import { Client, GatewayIntentBits } from 'discord.js';
 import { joinVoiceChannel, VoiceConnectionStatus } from '@discordjs/voice';
 import Prism from 'prism-media';
 import { createWriteStream } from 'fs';
-import { unlink, writeFile, mkdir } from 'fs/promises';
+import { unlink, writeFile, mkdir, readFile } from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import ffmpeg from 'fluent-ffmpeg';
@@ -90,6 +90,76 @@ async function transcribeAndAddToSession(wavFilePath, username, sessionData) {
   } catch (error) {
     console.error(`[WHISPER] Error transcribing audio for ${username}:`, error);
     throw error;
+  }
+}
+
+// Function to generate summary using OpenAI
+async function generateSummary(sessionData) {
+  try {
+    const templatePath = path.join(__dirname, 'templates', 'default.md');
+    let template = await readFile(templatePath, 'utf8');
+    
+    // Prepare transcript text
+    const transcriptText = sessionData.transcriptions
+      .map(t => `${t.user}: ${t.text}`)
+      .join('\n');
+    
+    if (!transcriptText.trim()) {
+      console.log('[SUMMARY] No transcriptions to summarize');
+      return null;
+    }
+    
+    const prompt = `Analyze this meeting transcript and provide ONLY the requested information in the exact format specified below. Do not include any headers, explanations, or extra text.
+
+Transcript:
+${transcriptText}
+
+Please respond with exactly three sections separated by "---SECTION---":
+
+1. First section: Key points (bullet points, 3-5 main topics discussed)
+2. Second section: Discussion summary (2-3 sentences summarizing the overall conversation)
+3. Third section: Action items (checkbox format using "- [ ]", only if explicit tasks/actions were mentioned, otherwise write "None")
+
+Format your response exactly like this:
+[bullet points for key topics]
+---SECTION---
+[2-3 sentence summary]
+---SECTION---
+[checkbox action items or "None"]`;
+    
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.2
+    });
+    
+    const aiResponse = completion.choices[0].message.content;
+    const sections = aiResponse.split('---SECTION---').map(s => s.trim());
+    
+    // Calculate duration
+    const startTime = new Date(sessionData.startTime);
+    const endTime = new Date(sessionData.endTime);
+    const durationMs = endTime - startTime;
+    const durationMin = Math.round(durationMs / 60000);
+    
+    // Get participants
+    const participants = [...new Set(sessionData.transcriptions.map(t => t.user))].join(', ');
+    
+    // Fill template placeholders
+    template = template.replace('[date]', startTime.toLocaleDateString());
+    template = template.replace('[channel]', sessionData.channelName);
+    template = template.replace('[duration]', `${durationMin} minutes`);
+    template = template.replace('[participants]', participants || 'None');
+    
+    // Fill content sections with parsed AI response
+    template = template.replace('[key_points]', sections[0] || 'None');
+    template = template.replace('[discussion_summary]', sections[1] || 'No discussion summary available');
+    template = template.replace('[action_items]', sections[2] || 'None');
+    
+    return template;
+  } catch (error) {
+    console.error('[SUMMARY] Error generating summary:', error);
+    return null;
   }
 }
 
@@ -350,6 +420,21 @@ client.on('messageCreate', async (message) => {
       console.log(`[SESSION] Recording session ${recordingSession.sessionId} ended`);
       console.log(`[SESSION] Session file saved: ${path.basename(sessionFile)}`);
       console.log(`[SESSION] Total transcriptions: ${recordingSession.transcriptions.length}`);
+      
+      // Generate and save summary
+      if (recordingSession.transcriptions.length > 0) {
+        try {
+          const summary = await generateSummary(recordingSession);
+          if (summary) {
+            const sessionFolder = path.join(__dirname, 'sessions', `session_${recordingSession.sessionId}`);
+            const summaryFile = path.join(sessionFolder, 'summary.md');
+            await writeFile(summaryFile, summary);
+            console.log(`[SUMMARY] Summary saved: ${path.relative(__dirname, summaryFile)}`);
+          }
+        } catch (summaryError) {
+          console.error(`[SUMMARY] Error generating summary:`, summaryError);
+        }
+      }
     } catch (error) {
       console.error(`[SESSION] Error saving final session:`, error);
     }

@@ -1,6 +1,6 @@
 // index.js
 import dotenv from 'dotenv';
-import { Client, GatewayIntentBits } from 'discord.js';
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
 import { joinVoiceChannel, VoiceConnectionStatus } from '@discordjs/voice';
 import Prism from 'prism-media';
 import { createWriteStream } from 'fs';
@@ -187,30 +187,61 @@ const client = new Client({
   ]
 });
 
-client.once('ready', () => {
+// Define slash commands
+const commands = [
+  new SlashCommandBuilder()
+    .setName('record')
+    .setDescription('Start recording voice channel'),
+  new SlashCommandBuilder()
+    .setName('stop')
+    .setDescription('Stop recording and generate summary')
+].map(command => command.toJSON());
+
+// Register slash commands
+async function registerCommands() {
+  try {
+    const rest = new REST().setToken(process.env.DISCORD_TOKEN);
+    console.log('[SLASH] Started refreshing application (/) commands.');
+    
+    // Register commands globally (you can also register per guild for faster updates during development)
+    await rest.put(
+      Routes.applicationCommands(process.env.DISCORD_CLIENT_ID),
+      { body: commands },
+    );
+    
+    console.log('[SLASH] Successfully reloaded application (/) commands.');
+  } catch (error) {
+    console.error('[SLASH] Error registering commands:', error);
+  }
+}
+
+client.once('ready', async () => {
   console.log(`Connected as ${client.user.tag}`);
+  await registerCommands();
 });
 
-client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
+// Handle slash command interactions
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
   
-  const textChannel = message.channel;
-  
-  // Handle !record command
-  if (message.content === '!record') {
-    if (message.author.id !== AUTHORIZED_USER_ID) {
-      console.log(`[AUTH] Unauthorized user ${message.author.username} (${message.author.id}) attempted to start recording`);
+  // Handle /record command
+  if (interaction.commandName === 'record') {
+    if (interaction.user.id !== AUTHORIZED_USER_ID) {
+      console.log(`[AUTH] Unauthorized user ${interaction.user.username} (${interaction.user.id}) attempted to start recording`);
+      await interaction.reply({ content: 'You are not authorized to use this command.', ephemeral: true });
       return;
     }
     
     if (isRecording) {
-      console.log(`[RECORD] Recording already in progress, ignoring command from ${message.author.username}`);
+      console.log(`[RECORD] Recording already in progress, ignoring command from ${interaction.user.username}`);
+      await interaction.reply({ content: 'Recording is already in progress.', ephemeral: true });
       return;
     }
     
-    const voiceChannel = message.member.voice.channel;
+    const voiceChannel = interaction.member.voice.channel;
     if (!voiceChannel) {
-      console.log(`[RECORD] User ${message.author.username} not in voice channel, cannot start recording`);
+      console.log(`[RECORD] User ${interaction.user.username} not in voice channel, cannot start recording`);
+      await interaction.reply({ content: 'You must be in a voice channel to start recording.', ephemeral: true });
       return;
     }
 
@@ -368,19 +399,24 @@ client.on('messageCreate', async (message) => {
     });
 
     console.log(`[SESSION] Recording session ${sessionId} started in voice channel: ${voiceChannel.name}`);
+    await interaction.reply({ content: `Recording started in ${voiceChannel.name}`, ephemeral: true });
   }
   
-  // Handle !stop command
-  else if (message.content === '!stop') {
-    if (message.author.id !== AUTHORIZED_USER_ID) {
-      console.log(`[AUTH] Unauthorized user ${message.author.username} (${message.author.id}) attempted to stop recording`);
+  // Handle /stop command
+  else if (interaction.commandName === 'stop') {
+    if (interaction.user.id !== AUTHORIZED_USER_ID) {
+      console.log(`[AUTH] Unauthorized user ${interaction.user.username} (${interaction.user.id}) attempted to stop recording`);
+      await interaction.reply({ content: 'You are not authorized to use this command.', ephemeral: true });
       return;
     }
     
     if (!isRecording) {
-      console.log(`[STOP] No recording in progress, ignoring command from ${message.author.username}`);
+      console.log(`[STOP] No recording in progress, ignoring command from ${interaction.user.username}`);
+      await interaction.reply({ content: 'No recording is currently in progress.', ephemeral: true });
       return;
     }
+    
+    await interaction.reply({ content: 'Stopping recording and generating summary...', ephemeral: true });
 
     // Stop recording session
     isRecording = false;
@@ -443,4 +479,4 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-client.login(process.env.DISCORD_BOT_TOKEN);
+client.login(process.env.DISCORD_TOKEN);

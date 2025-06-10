@@ -94,10 +94,14 @@ async function transcribeAndAddToSession(wavFilePath, username, sessionData) {
 }
 
 // Function to generate summary using OpenAI
-async function generateSummary(sessionData) {
+async function generateSummary(sessionData, templateName = 'default') {
   try {
-    const templatePath = path.join(__dirname, 'templates', 'default.md');
+    const templatePath = path.join(__dirname, 'templates', `${templateName}.md`);
     let template = await readFile(templatePath, 'utf8');
+    
+    // Load template configurations
+    const templateConfigs = await loadTemplateConfigs();
+    const templateConfig = templateConfigs[templateName] || templateConfigs.default;
     
     // Prepare transcript text
     const transcriptText = sessionData.transcriptions
@@ -109,23 +113,8 @@ async function generateSummary(sessionData) {
       return null;
     }
     
-    const prompt = `Analyze this meeting transcript and provide ONLY the requested information in the exact format specified below. Do not include any headers, explanations, or extra text.
-
-Transcript:
-${transcriptText}
-
-Please respond with exactly three sections separated by "---SECTION---":
-
-1. First section: Key points (bullet points, 3-5 main topics discussed)
-2. Second section: Discussion summary (2-3 sentences summarizing the overall conversation)
-3. Third section: Action items (checkbox format using "- [ ]", only if explicit tasks/actions were mentioned, otherwise write "None")
-
-Format your response exactly like this:
-[bullet points for key topics]
----SECTION---
-[2-3 sentence summary]
----SECTION---
-[checkbox action items or "None"]`;
+    // Use template-specific prompt with transcript injection
+    const prompt = templateConfig.prompt.replace('{transcript}', transcriptText);
     
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -187,21 +176,49 @@ const client = new Client({
   ]
 });
 
+// Load template configurations
+async function loadTemplateConfigs() {
+  try {
+    const configPath = path.join(__dirname, 'templates', 'templates.json');
+    const configData = await readFile(configPath, 'utf8');
+    return JSON.parse(configData);
+  } catch (error) {
+    console.error('[TEMPLATES] Error loading template configs:', error);
+    return { default: { name: 'Default', description: 'Default template' } };
+  }
+}
+
 // Define slash commands
-const commands = [
-  new SlashCommandBuilder()
-    .setName('record')
-    .setDescription('Start recording voice channel'),
-  new SlashCommandBuilder()
-    .setName('stop')
-    .setDescription('Stop recording and generate summary')
-].map(command => command.toJSON());
+async function createCommands() {
+  const templateConfigs = await loadTemplateConfigs();
+  const templateChoices = Object.entries(templateConfigs).map(([key, config]) => ({
+    name: config.name,
+    value: key
+  }));
+
+  return [
+    new SlashCommandBuilder()
+      .setName('record')
+      .setDescription('Start recording voice channel'),
+    new SlashCommandBuilder()
+      .setName('stop')
+      .setDescription('Stop recording and generate summary')
+      .addStringOption(option =>
+        option.setName('template')
+          .setDescription('Choose a template for the summary')
+          .addChoices(...templateChoices)
+          .setRequired(false)
+      )
+  ].map(command => command.toJSON());
+}
 
 // Register slash commands
 async function registerCommands() {
   try {
     const rest = new REST().setToken(process.env.DISCORD_TOKEN);
     console.log('[SLASH] Started refreshing application (/) commands.');
+    
+    const commands = await createCommands();
     
     // Register commands globally (you can also register per guild for faster updates during development)
     await rest.put(
@@ -416,7 +433,11 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
     
-    await interaction.reply({ content: 'Stopping recording and generating summary...', ephemeral: true });
+    // Get template choice from user
+    const templateChoice = interaction.options.getString('template') || 'default';
+    recordingSession.templateChoice = templateChoice;
+    
+    await interaction.reply({ content: `Stopping recording and generating summary using ${templateChoice} template...`, ephemeral: true });
 
     // Stop recording session
     isRecording = false;
@@ -460,7 +481,9 @@ client.on('interactionCreate', async (interaction) => {
       // Generate and save summary
       if (recordingSession.transcriptions.length > 0) {
         try {
-          const summary = await generateSummary(recordingSession);
+          // Get template choice from interaction (will be null for old sessions)
+          const templateChoice = recordingSession.templateChoice || 'default';
+          const summary = await generateSummary(recordingSession, templateChoice);
           if (summary) {
             const sessionFolder = path.join(__dirname, 'sessions', `session_${recordingSession.sessionId}`);
             const summaryFile = path.join(sessionFolder, 'summary.md');

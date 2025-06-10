@@ -1,0 +1,17 @@
+{
+  "default": {
+    "name": "Default Meeting",
+    "description": "Standard meeting summary format",
+    "prompt": "Analyze this meeting transcript and provide ONLY the requested information in the exact format specified below. Do not include any headers, explanations, or extra text.\n\nTranscript:\n{transcript}\n\nPlease respond with exactly three sections separated by \"---SECTION---\":\n\n1. First section: Key points (bullet points, 3-5 main topics discussed)\n2. Second section: Discussion summary (2-3 sentences summarizing the overall conversation)\n3. Third section: Action items (checkbox format using \"- [ ]\", only if explicit tasks/actions were mentioned, otherwise write \"None\")\n\nFormat your response exactly like this:\n[bullet points for key topics]\n---SECTION---\n[2-3 sentence summary]\n---SECTION---\n[checkbox action items or \"None\"]"
+  },
+  "standup": {
+    "name": "Daily Standup",
+    "description": "Daily standup meeting format",
+    "prompt": "Analyze this standup meeting transcript and provide ONLY the requested information in the exact format specified below.\n\nTranscript:\n{transcript}\n\nPlease respond with exactly three sections separated by \"---SECTION---\":\n\n1. First section: What was accomplished (bullet points for each person's completed work)\n2. Second section: Current priorities (what each person is working on today)\n3. Third section: Blockers and help needed (checkbox format using \"- [ ]\" for any blockers or requests for help, otherwise write \"None\")\n\nFormat your response exactly like this:\n[bullet points for completed work]\n---SECTION---\n[bullet points for current work]\n---SECTION---\n[checkbox blockers/help needed or \"None\"]"
+  },
+  "brainstorm": {
+    "name": "Brainstorming Session",
+    "description": "Creative brainstorming session format",
+    "prompt": "Analyze this brainstorming session transcript and provide ONLY the requested information in the exact format specified below.\n\nTranscript:\n{transcript}\n\nPlease respond with exactly three sections separated by \"---SECTION---\":\n\n1. First section: Ideas generated (bullet points for all creative ideas mentioned)\n2. Second section: Preferred solutions (2-3 sentences about the most promising ideas discussed)\n3. Third section: Next steps (checkbox format using \"- [ ]\" for concrete next actions, otherwise write \"None\")\n\nFormat your response exactly like this:\n[bullet points for all ideas]\n---SECTION---\n[summary of preferred solutions]\n---SECTION---\n[checkbox next steps or \"None\"]"
+  }
+}

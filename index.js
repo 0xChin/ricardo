@@ -45,16 +45,40 @@ async function syncToNotion(summary, pageId) {
       blocks.splice(100);
     }
     
-    // Clear existing content on the page
-    await clearNotionPage(pageId);
+    // Add divider and timestamp before the summary
+    const dividerBlocks = [
+      {
+        object: 'block',
+        type: 'divider',
+        divider: {}
+      },
+      {
+        object: 'block',
+        type: 'paragraph',
+        paragraph: {
+          rich_text: [
+            {
+              type: 'text',
+              text: {
+                content: `Meeting Summary - ${new Date().toLocaleString()}`
+              },
+              annotations: {
+                bold: true,
+                color: 'gray'
+              }
+            }
+          ]
+        }
+      }
+    ];
     
-    // Add new content
+    // Append divider, timestamp, and summary to existing content
     await notion.blocks.children.append({
       block_id: pageId,
-      children: blocks,
+      children: [...dividerBlocks, ...blocks],
     });
     
-    console.log(`[NOTION] Successfully synced summary to Notion page`);
+    console.log(`[NOTION] Successfully appended summary to Notion page`);
     return true;
   } catch (error) {
     console.error(`[NOTION] Error syncing to Notion:`, error);
@@ -62,27 +86,23 @@ async function syncToNotion(summary, pageId) {
   }
 }
 
-// Function to clear existing content from Notion page
-async function clearNotionPage(pageId) {
+// Function to add a divider to separate summaries (no longer clearing page)
+async function addNotionDivider(pageId) {
   try {
-    console.log(`[NOTION] Clearing existing content from page: ${pageId}`);
+    const dividerBlock = {
+      object: 'block',
+      type: 'divider',
+      divider: {}
+    };
     
-    const response = await notion.blocks.children.list({
+    await notion.blocks.children.append({
       block_id: pageId,
-      page_size: 100,
+      children: [dividerBlock],
     });
     
-    // Delete all existing blocks
-    for (const block of response.results) {
-      console.log(`[NOTION] Deleting block: ${block.id}`);
-      await notion.blocks.delete({
-        block_id: block.id,
-      });
-    }
-    
-    console.log(`[NOTION] Cleared ${response.results.length} blocks from page`);
+    console.log(`[NOTION] Added divider to page`);
   } catch (error) {
-    console.error(`[NOTION] Error clearing page:`, error);
+    console.error(`[NOTION] Error adding divider:`, error);
     throw error;
   }
 }

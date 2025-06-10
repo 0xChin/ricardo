@@ -4,7 +4,7 @@ import { Client, GatewayIntentBits } from 'discord.js';
 import { joinVoiceChannel, VoiceConnectionStatus } from '@discordjs/voice';
 import Prism from 'prism-media';
 import { createWriteStream } from 'fs';
-import { unlink, writeFile } from 'fs/promises';
+import { unlink, writeFile, mkdir } from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import ffmpeg from 'fluent-ffmpeg';
@@ -96,9 +96,11 @@ async function transcribeAndAddToSession(wavFilePath, username, sessionData) {
 // Function to save session data to JSON
 async function saveSessionToJson(sessionData) {
   try {
-    const sessionFilename = path.join(__dirname, `recording_session_${sessionData.sessionId}.json`);
+    const sessionFolder = path.join(__dirname, 'sessions', `session_${sessionData.sessionId}`);
+    await mkdir(sessionFolder, { recursive: true });
+    const sessionFilename = path.join(sessionFolder, `recording_session_${sessionData.sessionId}.json`);
     await writeFile(sessionFilename, JSON.stringify(sessionData, null, 2));
-    console.log(`[SESSION] Session data saved to: ${path.basename(sessionFilename)}`);
+    console.log(`[SESSION] Session data saved to: ${path.relative(__dirname, sessionFilename)}`);
     return sessionFilename;
   } catch (error) {
     console.error(`[SESSION] Error saving session data:`, error);
@@ -181,8 +183,10 @@ client.on('messageCreate', async (message) => {
         try {
           const user = await client.users.fetch(userId);
           const timestamp = Date.now();
-          const filename = path.join(__dirname, `session_${sessionId}_${userId}_${timestamp}.pcm`);
-          const wavFilename = path.join(__dirname, `session_${sessionId}_${userId}_${timestamp}.wav`);
+          const sessionFolder = path.join(__dirname, 'sessions', `session_${sessionId}`);
+          await mkdir(sessionFolder, { recursive: true });
+          const filename = path.join(sessionFolder, `session_${sessionId}_${userId}_${timestamp}.pcm`);
+          const wavFilename = path.join(sessionFolder, `session_${sessionId}_${userId}_${timestamp}.wav`);
           const writeStream = createWriteStream(filename);
 
           // Use longer silence duration (30 seconds) to prevent premature ending

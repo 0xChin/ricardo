@@ -224,9 +224,20 @@ async function generateSummary(sessionData, templateName = 'default') {
     template = template.replace('[participants]', participants || 'None');
     
     // Fill content sections with parsed AI response
-    template = template.replace('[key_points]', sections[0] || 'None');
-    template = template.replace('[discussion_summary]', sections[1] || 'No discussion summary available');
-    template = template.replace('[action_items]', sections[2] || 'None');
+    // For default template: sections[0] = title, sections[1] = key_points, sections[2] = summary, sections[3] = action_items
+    // For other templates: keep existing 3-section format
+    if (templateName === 'default' && sections.length >= 4) {
+      template = template.replace('[title]', sections[0] || 'Meeting Summary');
+      template = template.replace('[key_points]', sections[1] || 'None');
+      template = template.replace('[discussion_summary]', sections[2] || 'No discussion summary available');
+      template = template.replace('[action_items]', sections[3] || 'None');
+    } else {
+      // Fallback for other templates or if parsing fails
+      template = template.replace('[title]', 'Meeting Summary'); // fallback title
+      template = template.replace('[key_points]', sections[0] || 'None');
+      template = template.replace('[discussion_summary]', sections[1] || 'No discussion summary available');
+      template = template.replace('[action_items]', sections[2] || 'None');
+    }
     
     return template;
   } catch (error) {

@@ -1,4 +1,4 @@
-# Meeting Summary
+# [title]
 
 **Date:** [date]
 **Channel:** [channel]

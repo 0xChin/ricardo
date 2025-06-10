@@ -1,6 +1,8 @@
 // index.js
 import dotenv from 'dotenv';
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
+import { Client as NotionClient } from '@notionhq/client';
+import { markdownToBlocks } from '@tryfabric/martian';
 import { joinVoiceChannel, VoiceConnectionStatus } from '@discordjs/voice';
 import Prism from 'prism-media';
 import { createWriteStream } from 'fs';
@@ -23,6 +25,67 @@ ffmpeg.setFfmpegPath(ffmpegStatic);
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
+
+// Configure Notion
+const notion = new NotionClient({
+  auth: process.env.NOTION_KEY,
+});
+
+// Function to sync summary to Notion page
+async function syncToNotion(summary, pageId) {
+  try {
+    console.log(`[NOTION] Syncing summary to Notion page: ${pageId}`);
+    
+    // Convert markdown to Notion blocks
+    const blocks = markdownToBlocks(summary);
+    
+    // Limit to 100 blocks (Notion API limitation)
+    if (blocks.length > 100) {
+      console.log(`[NOTION] Warning: Summary has ${blocks.length} blocks, truncating to 100`);
+      blocks.splice(100);
+    }
+    
+    // Clear existing content on the page
+    await clearNotionPage(pageId);
+    
+    // Add new content
+    await notion.blocks.children.append({
+      block_id: pageId,
+      children: blocks,
+    });
+    
+    console.log(`[NOTION] Successfully synced summary to Notion page`);
+    return true;
+  } catch (error) {
+    console.error(`[NOTION] Error syncing to Notion:`, error);
+    return false;
+  }
+}
+
+// Function to clear existing content from Notion page
+async function clearNotionPage(pageId) {
+  try {
+    console.log(`[NOTION] Clearing existing content from page: ${pageId}`);
+    
+    const response = await notion.blocks.children.list({
+      block_id: pageId,
+      page_size: 100,
+    });
+    
+    // Delete all existing blocks
+    for (const block of response.results) {
+      console.log(`[NOTION] Deleting block: ${block.id}`);
+      await notion.blocks.delete({
+        block_id: block.id,
+      });
+    }
+    
+    console.log(`[NOTION] Cleared ${response.results.length} blocks from page`);
+  } catch (error) {
+    console.error(`[NOTION] Error clearing page:`, error);
+    throw error;
+  }
+}
 
 let connection;
 const userStreams = new Map();
@@ -207,6 +270,11 @@ async function createCommands() {
         option.setName('template')
           .setDescription('Choose a template for the summary')
           .addChoices(...templateChoices)
+          .setRequired(false)
+      )
+      .addStringOption(option =>
+        option.setName('notion_page_id')
+          .setDescription('Notion page ID to sync the summary to (optional)')
           .setRequired(false)
       )
   ].map(command => command.toJSON());
@@ -436,11 +504,14 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
     
-    // Get template choice from user
+    // Get template choice and notion page ID from user
     const templateChoice = interaction.options.getString('template') || 'default';
+    const notionPageId = interaction.options.getString('notion_page_id');
     recordingSession.templateChoice = templateChoice;
+    recordingSession.notionPageId = notionPageId;
     
-    await interaction.reply({ content: `Stopping recording and generating summary using ${templateChoice} template...`, ephemeral: true });
+    const notionText = notionPageId ? ' and syncing to Notion' : '';
+    await interaction.reply({ content: `Stopping recording and generating summary using ${templateChoice} template${notionText}...`, ephemeral: true });
 
     // Stop recording session
     isRecording = false;
@@ -492,6 +563,20 @@ client.on('interactionCreate', async (interaction) => {
             const summaryFile = path.join(sessionFolder, 'summary.md');
             await writeFile(summaryFile, summary);
             console.log(`[SUMMARY] Summary saved: ${path.relative(__dirname, summaryFile)}`);
+            
+            // Sync to Notion if page ID was provided
+            if (recordingSession.notionPageId) {
+              try {
+                const notionSuccess = await syncToNotion(summary, recordingSession.notionPageId);
+                if (notionSuccess) {
+                  console.log(`[NOTION] Successfully synced summary to Notion page: ${recordingSession.notionPageId}`);
+                } else {
+                  console.log(`[NOTION] Failed to sync summary to Notion page: ${recordingSession.notionPageId}`);
+                }
+              } catch (notionError) {
+                console.error(`[NOTION] Error syncing to Notion:`, notionError);
+              }
+            }
           }
         } catch (summaryError) {
           console.error(`[SUMMARY] Error generating summary:`, summaryError);

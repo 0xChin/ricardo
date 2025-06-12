@@ -1,624 +1,429 @@
 // index.js
-import dotenv from 'dotenv';
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
-import { Client as NotionClient } from '@notionhq/client';
-import { markdownToBlocks } from '@tryfabric/martian';
-import { joinVoiceChannel, VoiceConnectionStatus } from '@discordjs/voice';
-import Prism from 'prism-media';
-import { createWriteStream } from 'fs';
-import { unlink, writeFile, mkdir, readFile } from 'fs/promises';
+import { joinVoiceChannel, VoiceConnectionStatus, entersState } from '@discordjs/voice';
+import { createWriteStream, createReadStream } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import ffmpeg from 'fluent-ffmpeg';
-import ffmpegStatic from 'ffmpeg-static';
-import OpenAI from 'openai';
-import { createReadStream } from 'fs';
+import Prism from 'prism-media';
+import axios from 'axios';
+import dotenv from 'dotenv';
+import { Dropbox } from 'dropbox';
 
 dotenv.config();
+
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers,
+    ],
+});
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Configure ffmpeg
-ffmpeg.setFfmpegPath(ffmpegStatic);
-
-// Configure OpenAI
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
-
-// Configure Notion
-const notion = new NotionClient({
-  auth: process.env.NOTION_KEY,
-});
-
-// Function to sync summary to Notion page
-async function syncToNotion(summary, pageId) {
-  try {
-    console.log(`[NOTION] Syncing summary to Notion page: ${pageId}`);
-    
-    // Convert markdown to Notion blocks
-    const blocks = markdownToBlocks(summary);
-    
-    // Limit to 100 blocks (Notion API limitation)
-    if (blocks.length > 100) {
-      console.log(`[NOTION] Warning: Summary has ${blocks.length} blocks, truncating to 100`);
-      blocks.splice(100);
-    }
-    
-    // Add divider and timestamp before the summary
-    const dividerBlocks = [
-      {
-        object: 'block',
-        type: 'divider',
-        divider: {}
-      },
-      {
-        object: 'block',
-        type: 'paragraph',
-        paragraph: {
-          rich_text: [
-            {
-              type: 'text',
-              text: {
-                content: `Meeting Summary - ${new Date().toLocaleString()}`
-              },
-              annotations: {
-                bold: true,
-                color: 'gray'
-              }
-            }
-          ]
-        }
-      }
-    ];
-    
-    // Append divider, timestamp, and summary to existing content
-    await notion.blocks.children.append({
-      block_id: pageId,
-      children: [...dividerBlocks, ...blocks],
-    });
-    
-    console.log(`[NOTION] Successfully appended summary to Notion page`);
-    return true;
-  } catch (error) {
-    console.error(`[NOTION] Error syncing to Notion:`, error);
-    return false;
-  }
-}
-
-// Function to add a divider to separate summaries (no longer clearing page)
-async function addNotionDivider(pageId) {
-  try {
-    const dividerBlock = {
-      object: 'block',
-      type: 'divider',
-      divider: {}
-    };
-    
-    await notion.blocks.children.append({
-      block_id: pageId,
-      children: [dividerBlock],
-    });
-    
-    console.log(`[NOTION] Added divider to page`);
-  } catch (error) {
-    console.error(`[NOTION] Error adding divider:`, error);
-    throw error;
-  }
-}
-
-let connection;
-const userStreams = new Map();
-const endTimers = new Map(); // Track end timers to debounce end events
-const AUTHORIZED_USER_ID = '356096935062405120'; // User ID authorized to control recording
+let recordingStreams = new Map();
+let outputStream = null;
+let currentConnection = null;
+let audioChunks = [];
+let currentOutputPath = null;
 let isRecording = false;
-let recordingSession = null;
+let startTime = null;
+let currentChannelName = null;
 
-// Function to convert PCM to WAV
-async function convertPcmToWav(pcmFilePath, wavFilePath) {
-  return new Promise((resolve, reject) => {
-    ffmpeg()
-      .input(pcmFilePath)
-      .inputFormat('s16le') // 16-bit signed little-endian PCM
-      .inputOptions([
-        '-ar 48000', // Sample rate 48kHz
-        '-ac 2'      // 2 channels (stereo)
-      ])
-      .output(wavFilePath)
-      .audioCodec('pcm_s16le')
-      .format('wav')
-      .on('end', () => {
-        console.log(`[CONVERT] Successfully converted ${pcmFilePath} to ${wavFilePath}`);
-        // Delete the PCM file after conversion
-        unlink(pcmFilePath).catch(err => console.error(`Error deleting PCM file: ${err}`));
-        resolve();
-      })
-      .on('error', (err) => {
-        console.error(`[CONVERT] Error converting ${pcmFilePath}:`, err);
-        reject(err);
-      })
-      .run();
-  });
+// WAV header constants
+const SAMPLE_RATE = 48000;
+const CHANNELS = 2;
+const BITS_PER_SAMPLE = 16;
+
+// Add participant tracking
+let currentParticipants = new Set();
+
+const DROPBOX_ACCESS_TOKEN = process.env.DROPBOX_ACCESS_TOKEN;
+const dbx = new Dropbox({ accessToken: DROPBOX_ACCESS_TOKEN });
+
+async function uploadToDropbox(filePath) {
+    const fileName = path.basename(filePath);
+    const fileContents = await new Promise((resolve, reject) => {
+        const chunks = [];
+        const stream = createReadStream(filePath);
+        stream.on('data', chunk => chunks.push(chunk));
+        stream.on('end', () => resolve(Buffer.concat(chunks)));
+        stream.on('error', reject);
+    });
+    const dropboxPath = `/${fileName}`;
+    await dbx.filesUpload({
+        path: dropboxPath,
+        contents: fileContents,
+        mode: 'overwrite',
+        autorename: false,
+        mute: true,
+    });
+    // Try to create a shared link, or fetch it if it already exists
+    let sharedLink;
+    try {
+        const res = await dbx.sharingCreateSharedLinkWithSettings({ path: dropboxPath });
+        sharedLink = res.result.url;
+    } catch (e) {
+        if (
+            (e.error && e.error.error_shared_link_already_exists) ||
+            (e.error && e.error['.tag'] === 'shared_link_already_exists')
+        ) {
+            const res = await dbx.sharingListSharedLinks({ path: dropboxPath, direct_only: true });
+            if (res.result.links.length > 0) {
+                sharedLink = res.result.links[0].url;
+            } else {
+                throw new Error('Shared link already exists but could not be retrieved.');
+            }
+        } else {
+            throw e;
+        }
+    }
+    // Convert to direct download link (dl.dropboxusercontent.com)
+    let directLink = sharedLink.replace('www.dropbox.com', 'dl.dropboxusercontent.com');
+    // Remove ?dl=0, ?dl=1, or ?raw=1 but keep other query params (like rlkey)
+    directLink = directLink.replace(/\?(dl|raw)=\d?/, '');
+    return directLink;
 }
 
-// Function to transcribe audio using Whisper and add to session
-async function transcribeAndAddToSession(wavFilePath, username, sessionData) {
-  try {
-    console.log(`[WHISPER] Starting transcription for ${username}...`);
+async function uploadToFireflies(filePath) {
+    try {
+        // First upload to Dropbox
+        const fileUrl = await uploadToDropbox(filePath);
+        
+        const url = "https://api.fireflies.ai/graphql";
+        const headers = {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.FIREFLIES_API_KEY}`,
+        };
+
+        // Convert participants to Fireflies format
+        const attendees = Array.from(currentParticipants).map(member => ({
+            displayName: member.displayName || member.user.username,
+            email: `${member.user.username.toLowerCase()}@discord.user`  // Placeholder email
+        }));
+
+        const input = {
+            url: fileUrl,
+            title: path.basename(filePath, '.wav'),
+            attendees: attendees
+        };
+
+        console.log('Sending to Fireflies with input:', JSON.stringify(input, null, 2));
+
+        const data = {
+            query: `       
+            mutation($input: AudioUploadInput) {
+                uploadAudio(input: $input) {
+                    success
+                    title
+                    message
+                }
+            }`,
+            variables: { input }
+        };
+
+        console.log('Sending GraphQL request to Fireflies...');
+        const response = await axios.post(url, data, { headers });
+        console.log('Fireflies response:', JSON.stringify(response.data, null, 2));
+        
+        if (!response.data.data.uploadAudio.success) {
+            throw new Error(`Fireflies API error: ${response.data.data.uploadAudio.message}`);
+        }
+
+        return response.data.data.uploadAudio;
+    } catch (error) {
+        console.error('Error uploading to Fireflies:', error.message);
+        if (error.response) {
+            console.error('Response data:', error.response.data);
+            console.error('Response status:', error.response.status);
+        }
+        throw error;
+    }
+}
+
+function createWavHeader(dataSize) {
+    const buffer = Buffer.alloc(44);
     
-    // Polyfill for Node 18 compatibility with OpenAI library
-    if (!globalThis.File) {
-      const { File } = await import('node:buffer');
-      globalThis.File = File;
+    // RIFF identifier
+    buffer.write('RIFF', 0);
+    // File length minus RIFF identifier length and file description length
+    buffer.writeUInt32LE(36 + dataSize, 4);
+    // RIFF type
+    buffer.write('WAVE', 8);
+    // Format chunk identifier
+    buffer.write('fmt ', 12);
+    // Format chunk length
+    buffer.writeUInt32LE(16, 16);
+    // Sample format (raw)
+    buffer.writeUInt16LE(1, 20);
+    // Channel count
+    buffer.writeUInt16LE(CHANNELS, 22);
+    // Sample rate
+    buffer.writeUInt32LE(SAMPLE_RATE, 24);
+    // Byte rate (sample rate * block align)
+    buffer.writeUInt32LE(SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE / 8), 28);
+    // Block align (channel count * bytes per sample)
+    buffer.writeUInt16LE(CHANNELS * (BITS_PER_SAMPLE / 8), 32);
+    // Bits per sample
+    buffer.writeUInt16LE(BITS_PER_SAMPLE, 34);
+    // Data chunk identifier
+    buffer.write('data', 36);
+    // Data chunk length
+    buffer.writeUInt32LE(dataSize, 40);
+    
+    return buffer;
+}
+
+async function saveWavFile() {
+    if (!currentOutputPath) return;
+
+    // Sort chunks by timestamp
+    audioChunks.sort((a, b) => a.timestamp - b.timestamp);
+
+    // Combine all chunks in chronological order
+    let allPcmData = Buffer.alloc(0);
+    for (const chunk of audioChunks) {
+        allPcmData = Buffer.concat([allPcmData, chunk.data]);
     }
     
-    const transcription = await openai.audio.transcriptions.create({
-      file: createReadStream(wavFilePath),
-      model: 'gpt-4o-mini-transcribe',
-      response_format: 'json'
+    if (allPcmData.length === 0) return;
+
+    // Create WAV header
+    const wavHeader = createWavHeader(allPcmData.length);
+    
+    // Write WAV file
+    const fileStream = createWriteStream(currentOutputPath);
+    fileStream.write(wavHeader);
+    fileStream.write(allPcmData);
+    fileStream.end();
+
+    // Wait for the file to be written
+    await new Promise((resolve, reject) => {
+        fileStream.on('finish', resolve);
+        fileStream.on('error', reject);
     });
 
-    const transcriptionEntry = {
-      user: username,
-      timestamp: new Date().toISOString(),
-      text: transcription.text,
-      audioFile: path.basename(wavFilePath)
-    };
-
-    // Add to session transcriptions
-    sessionData.transcriptions.push(transcriptionEntry);
-    
-    console.log(`[WHISPER] Transcription completed for ${username}: "${transcription.text}"`);
-    return transcriptionEntry;
-  } catch (error) {
-    console.error(`[WHISPER] Error transcribing audio for ${username}:`, error);
-    throw error;
-  }
-}
-
-// Function to generate summary using OpenAI
-async function generateSummary(sessionData, templateName = 'default') {
-  try {
-    const templatePath = path.join(__dirname, 'templates', `${templateName}.md`);
-    let template = await readFile(templatePath, 'utf8');
-    
-    // Load template configurations
-    const templateConfigs = await loadTemplateConfigs();
-    const templateConfig = templateConfigs[templateName] || templateConfigs.default;
-    
-    // Prepare transcript text
-    const transcriptText = sessionData.transcriptions
-      .map(t => `${t.user}: ${t.text}`)
-      .join('\n');
-    
-    if (!transcriptText.trim()) {
-      console.log('[SUMMARY] No transcriptions to summarize');
-      return null;
+    // Upload to Fireflies.ai
+    try {
+        const uploadResult = await uploadToFireflies(currentOutputPath);
+        console.log('Uploaded to Fireflies:', uploadResult);
+        return uploadResult;
+    } catch (error) {
+        console.error('Failed to upload to Fireflies:', error);
+        throw error;
     }
-    
-    // Use template-specific prompt with transcript injection
-    const prompt = templateConfig.prompt.replace('{transcript}', transcriptText);
-    
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.2
-    });
-    
-    const aiResponse = completion.choices[0].message.content;
-    const sections = aiResponse.split('---SECTION---').map(s => s.trim());
-    
-    // Calculate duration
-    const startTime = new Date(sessionData.startTime);
-    const endTime = new Date(sessionData.endTime);
-    const durationMs = endTime - startTime;
-    const durationMin = Math.round(durationMs / 60000);
-    
-    // Get participants
-    const participants = [...new Set(sessionData.transcriptions.map(t => t.user))].join(', ');
-    
-    // Fill template placeholders
-    template = template.replace('[date]', startTime.toLocaleDateString());
-    template = template.replace('[channel]', sessionData.channelName);
-    template = template.replace('[duration]', `${durationMin} minutes`);
-    template = template.replace('[participants]', participants || 'None');
-    
-    // Fill content sections with parsed AI response
-    // For default template: sections[0] = title, sections[1] = key_points, sections[2] = summary, sections[3] = action_items
-    // For other templates: keep existing 3-section format
-    if (templateName === 'default' && sections.length >= 4) {
-      template = template.replace('[title]', sections[0] || 'Meeting Summary');
-      template = template.replace('[key_points]', sections[1] || 'None');
-      template = template.replace('[discussion_summary]', sections[2] || 'No discussion summary available');
-      template = template.replace('[action_items]', sections[3] || 'None');
-    } else {
-      // Fallback for other templates or if parsing fails
-      template = template.replace('[title]', 'Meeting Summary'); // fallback title
-      template = template.replace('[key_points]', sections[0] || 'None');
-      template = template.replace('[discussion_summary]', sections[1] || 'No discussion summary available');
-      template = template.replace('[action_items]', sections[2] || 'None');
-    }
-    
-    return template;
-  } catch (error) {
-    console.error('[SUMMARY] Error generating summary:', error);
-    return null;
-  }
-}
 
-// Function to save session data to JSON
-async function saveSessionToJson(sessionData) {
-  try {
-    const sessionFolder = path.join(__dirname, 'sessions', `session_${sessionData.sessionId}`);
-    await mkdir(sessionFolder, { recursive: true });
-    const sessionFilename = path.join(sessionFolder, `recording_session_${sessionData.sessionId}.json`);
-    await writeFile(sessionFilename, JSON.stringify(sessionData, null, 2));
-    console.log(`[SESSION] Session data saved to: ${path.relative(__dirname, sessionFilename)}`);
-    return sessionFilename;
-  } catch (error) {
-    console.error(`[SESSION] Error saving session data:`, error);
-    throw error;
-  }
-}
-
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
-});
-
-// Load template configurations
-async function loadTemplateConfigs() {
-  try {
-    const configPath = path.join(__dirname, 'templates', 'templates.json');
-    const configData = await readFile(configPath, 'utf8');
-    return JSON.parse(configData);
-  } catch (error) {
-    console.error('[TEMPLATES] Error loading template configs:', error);
-    return { default: { name: 'Default', description: 'Default template' } };
-  }
+    // Clear the chunks
+    audioChunks = [];
+    currentOutputPath = null;
+    isRecording = false;
+    startTime = null;
 }
 
 // Define slash commands
-async function createCommands() {
-  const templateConfigs = await loadTemplateConfigs();
-  const templateChoices = Object.entries(templateConfigs).map(([key, config]) => ({
-    name: config.name,
-    value: key
-  }));
-
-  return [
+const commands = [
     new SlashCommandBuilder()
-      .setName('record')
-      .setDescription('Start recording voice channel'),
+        .setName('record')
+        .setDescription('Start recording audio from the current voice channel'),
     new SlashCommandBuilder()
-      .setName('stop')
-      .setDescription('Stop recording and generate summary')
-      .addStringOption(option =>
-        option.setName('template')
-          .setDescription('Choose a template for the summary')
-          .addChoices(...templateChoices)
-          .setRequired(false)
-      )
-      .addStringOption(option =>
-        option.setName('notion_page_id')
-          .setDescription('Notion page ID to sync the summary to (optional)')
-          .setRequired(false)
-      )
-  ].map(command => command.toJSON());
-}
+        .setName('stop')
+        .setDescription('Stop the current recording'),
+].map(command => command.toJSON());
 
 // Register slash commands
-async function registerCommands() {
-  try {
-    const rest = new REST().setToken(process.env.DISCORD_TOKEN);
-    console.log('[SLASH] Started refreshing application (/) commands.');
-    
-    const commands = await createCommands();
-    
-    // Register commands globally (you can also register per guild for faster updates during development)
-    await rest.put(
-      Routes.applicationCommands(process.env.DISCORD_CLIENT_ID),
-      { body: commands },
-    );
-    
-    console.log('[SLASH] Successfully reloaded application (/) commands.');
-  } catch (error) {
-    console.error('[SLASH] Error registering commands:', error);
-  }
-}
+const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
-client.once('ready', async () => {
-  console.log(`Connected as ${client.user.tag}`);
-  await registerCommands();
+(async () => {
+    try {
+        console.log('Started refreshing application (/) commands.');
+
+        await rest.put(
+            Routes.applicationCommands(process.env.CLIENT_ID),
+            { body: commands },
+        );
+
+        console.log('Successfully reloaded application (/) commands.');
+    } catch (error) {
+        console.error(error);
+    }
+})();
+
+client.once('ready', () => {
+    console.log('Bot is ready!');
 });
 
-// Handle slash command interactions
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-  
-  // Handle /record command
-  if (interaction.commandName === 'record') {
-    if (interaction.user.id !== AUTHORIZED_USER_ID) {
-      console.log(`[AUTH] Unauthorized user ${interaction.user.username} (${interaction.user.id}) attempted to start recording`);
-      await interaction.reply({ content: 'You are not authorized to use this command.', ephemeral: true });
-      return;
-    }
-    
-    if (isRecording) {
-      console.log(`[RECORD] Recording already in progress, ignoring command from ${interaction.user.username}`);
-      await interaction.reply({ content: 'Recording is already in progress.', ephemeral: true });
-      return;
-    }
-    
-    const voiceChannel = interaction.member.voice.channel;
-    if (!voiceChannel) {
-      console.log(`[RECORD] User ${interaction.user.username} not in voice channel, cannot start recording`);
-      await interaction.reply({ content: 'You must be in a voice channel to start recording.', ephemeral: true });
-      return;
-    }
-
-    // Start recording session
-    isRecording = true;
-    const sessionId = Date.now();
-    recordingSession = {
-      sessionId: sessionId,
-      startTime: new Date().toISOString(),
-      endTime: null,
-      channelName: voiceChannel.name,
-      transcriptions: []
-    };
-
-    connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: voiceChannel.guild.id,
-      adapterCreator: voiceChannel.guild.voiceAdapterCreator
-    });
-
-    connection.on(VoiceConnectionStatus.Ready, () => {
-      const receiver = connection.receiver;
-
-      receiver.speaking.on('start', async (userId) => {
-        if (!isRecording) return;
-        
-        // Cancel any pending end timer for this user (if they started speaking again)
-        if (endTimers.has(userId)) {
-          clearTimeout(endTimers.get(userId));
-          endTimers.delete(userId);
-          console.log(`[START] Cancelled pending end timer for user ${userId} - user started speaking again`);
-        }
-
-        // Check if user is already being recorded
-        if (userStreams.has(userId)) {
-          console.log(`[START] User ${userId} is already being recorded, continuing existing stream`);
-          return;
-        }
-
-        try {
-          const user = await client.users.fetch(userId);
-          const timestamp = Date.now();
-          const sessionFolder = path.join(__dirname, 'sessions', `session_${sessionId}`);
-          await mkdir(sessionFolder, { recursive: true });
-          const filename = path.join(sessionFolder, `session_${sessionId}_${userId}_${timestamp}.pcm`);
-          const wavFilename = path.join(sessionFolder, `session_${sessionId}_${userId}_${timestamp}.wav`);
-          const writeStream = createWriteStream(filename);
-
-          // Use longer silence duration (30 seconds) to prevent premature ending
-          const opusStream = receiver.subscribe(userId, { end: { behavior: 'silence', duration: 30000 } });
-          const decoder = new Prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
-          const pcmStream = opusStream.pipe(decoder);
-          pcmStream.pipe(writeStream);
-
-          // Set the user stream info immediately to mark as recording
-          userStreams.set(userId, { 
-            writeStream, 
-            opusStream,
-            user: user.username,
-            startTime: timestamp,
-            pcmFilename: filename,
-            wavFilename: wavFilename
-          });
-          
-          console.log(`[START] Recording started for user ${user.username} (${userId})`);
-        } catch (error) {
-          console.error(`[START] Error starting recording for user ${userId}:`, error);
-          // Clean up any partial state in case of error
-          if (userStreams.has(userId)) {
-            userStreams.delete(userId);
-          }
-        }
-      });
-
-      receiver.speaking.on('end', async (userId) => {
-        if (!isRecording) return;
-        
-        // Check if user was actually being recorded
-        const info = userStreams.get(userId);
-        if (!info) {
-          console.log(`[END] Received end event for user ${userId} but no recording was active, ignoring`);
-          return;
-        }
-
-        // Implement debounced ending - wait 1 second before actually ending
-        // This prevents premature ending during brief pauses and accounts for user lag
-        console.log(`[END] End event received for user ${info.user} (${userId}), setting 1s delay before stopping`);
-        
-        // Clear any existing timer
-        if (endTimers.has(userId)) {
-          clearTimeout(endTimers.get(userId));
-        }
-
-        // Set a timer to actually end the recording after 3 seconds
-        const endTimer = setTimeout(async () => {
-          // Double-check the user is still in userStreams (might have restarted)
-          const currentInfo = userStreams.get(userId);
-          if (!currentInfo) {
-            console.log(`[END] User ${userId} no longer being recorded, timer cancelled`);
-            endTimers.delete(userId);
-            return;
-          }
-
-          try {
-            // Clean up streams
-            if (currentInfo.opusStream) {
-              currentInfo.opusStream.destroy();
-            }
-            if (currentInfo.writeStream) {
-              currentInfo.writeStream.end();
-            }
-            
-            // Remove from active recordings
-            userStreams.delete(userId);
-            endTimers.delete(userId);
-
-            const user = await client.users.fetch(userId);
-            const duration = Date.now() - currentInfo.startTime;
-            
-            console.log(`[END] Recording ended for user ${user.username} (${userId}) - Duration: ${duration}ms`);
-
-            // Convert PCM to WAV and transcribe asynchronously (non-blocking)
-            // This allows the bot to continue listening while processing previous audio
-            setImmediate(async () => {
-              try {
-                await convertPcmToWav(currentInfo.pcmFilename, currentInfo.wavFilename);
-                console.log(`[CONVERT] Audio converted: ${path.basename(currentInfo.wavFilename)}`);
-                
-                // Transcribe audio using Whisper and add to session
-                try {
-                  const transcriptionEntry = await transcribeAndAddToSession(
-                    currentInfo.wavFilename, 
-                    user.username,
-                    recordingSession
-                  );
-                  
-                  console.log(`[TRANSCRIPTION] ${user.username}: "${transcriptionEntry.text}"`);
-                  
-                  // Save updated session data
-                  await saveSessionToJson(recordingSession);
-                } catch (transcriptionError) {
-                  console.error(`[WHISPER] Failed to transcribe audio for ${user.username}:`, transcriptionError);
-                }
-              } catch (convertError) {
-                console.error(`[CONVERT] Failed to convert audio for ${user.username}:`, convertError);
-              }
-            });
-          } catch (error) {
-            console.error(`[END] Error ending recording for user ${userId}:`, error);
-            // Force cleanup even if there was an error
-            userStreams.delete(userId);
-            endTimers.delete(userId);
-          }
-        }, 1000); // 1 second delay
-
-        endTimers.set(userId, endTimer);
-      });
-    });
-
-    console.log(`[SESSION] Recording session ${sessionId} started in voice channel: ${voiceChannel.name}`);
-    await interaction.reply({ content: `Recording started in ${voiceChannel.name}`, ephemeral: true });
-  }
-  
-  // Handle /stop command
-  else if (interaction.commandName === 'stop') {
-    if (interaction.user.id !== AUTHORIZED_USER_ID) {
-      console.log(`[AUTH] Unauthorized user ${interaction.user.username} (${interaction.user.id}) attempted to stop recording`);
-      await interaction.reply({ content: 'You are not authorized to use this command.', ephemeral: true });
-      return;
-    }
-    
-    if (!isRecording) {
-      console.log(`[STOP] No recording in progress, ignoring command from ${interaction.user.username}`);
-      await interaction.reply({ content: 'No recording is currently in progress.', ephemeral: true });
-      return;
-    }
-    
-    // Get template choice and notion page ID from user
-    const templateChoice = interaction.options.getString('template') || 'default';
-    const notionPageId = interaction.options.getString('notion_page_id');
-    recordingSession.templateChoice = templateChoice;
-    recordingSession.notionPageId = notionPageId;
-    
-    const notionText = notionPageId ? ' and syncing to Notion' : '';
-    await interaction.reply({ content: `Stopping recording and generating summary using ${templateChoice} template${notionText}...`, ephemeral: true });
-
-    // Stop recording session
-    isRecording = false;
-    recordingSession.endTime = new Date().toISOString();
-    
-    // Clear all active recordings
-    for (const [userId, info] of userStreams) {
-      try {
-        if (info.opusStream) {
-          info.opusStream.destroy();
-        }
-        if (info.writeStream) {
-          info.writeStream.end();
-        }
-      } catch (error) {
-        console.error(`[STOP] Error cleaning up stream for user ${userId}:`, error);
-      }
-    }
-    
-    // Clear all timers
-    for (const timer of endTimers.values()) {
-      clearTimeout(timer);
-    }
-    
-    userStreams.clear();
-    endTimers.clear();
-    
-    // Disconnect from voice
-    if (connection) {
-      connection.destroy();
-      connection = null;
-    }
-    
-    // Save final session data
+client.on('interactionCreate', async interaction => {
     try {
-      const sessionFile = await saveSessionToJson(recordingSession);
-      console.log(`[SESSION] Recording session ${recordingSession.sessionId} ended`);
-      console.log(`[SESSION] Session file saved: ${path.basename(sessionFile)}`);
-      console.log(`[SESSION] Total transcriptions: ${recordingSession.transcriptions.length}`);
-      
-      // Generate and save summary
-      if (recordingSession.transcriptions.length > 0) {
-        try {
-          // Get template choice from interaction (will be null for old sessions)
-          const templateChoice = recordingSession.templateChoice || 'default';
-          const summary = await generateSummary(recordingSession, templateChoice);
-          if (summary) {
-            const sessionFolder = path.join(__dirname, 'sessions', `session_${recordingSession.sessionId}`);
-            const summaryFile = path.join(sessionFolder, 'summary.md');
-            await writeFile(summaryFile, summary);
-            console.log(`[SUMMARY] Summary saved: ${path.relative(__dirname, summaryFile)}`);
-            
-            // Sync to Notion if page ID was provided
-            if (recordingSession.notionPageId) {
-              try {
-                const notionSuccess = await syncToNotion(summary, recordingSession.notionPageId);
-                if (notionSuccess) {
-                  console.log(`[NOTION] Successfully synced summary to Notion page: ${recordingSession.notionPageId}`);
-                } else {
-                  console.log(`[NOTION] Failed to sync summary to Notion page: ${recordingSession.notionPageId}`);
-                }
-              } catch (notionError) {
-                console.error(`[NOTION] Error syncing to Notion:`, notionError);
-              }
+        if (!interaction.isCommand()) return;
+        
+        console.log('Command received:', interaction.commandName);
+        console.log('Guild ID:', interaction.guildId);
+        console.log('Channel ID:', interaction.channelId);
+        console.log('User ID:', interaction.user.id);
+
+        const { commandName } = interaction;
+
+        if (commandName === 'record') {
+            if (isRecording) {
+                return interaction.reply({
+                    content: 'Already recording! Use /stop to stop the current recording.',
+                    ephemeral: true
+                });
             }
-          }
-        } catch (summaryError) {
-          console.error(`[SUMMARY] Error generating summary:`, summaryError);
+
+            const member = interaction.member;
+            
+            console.log('Member voice channel:', member.voice.channel?.id);
+            
+            if (!member.voice.channel) {
+                return interaction.reply({
+                    content: 'You need to be in a voice channel to use this command!',
+                    ephemeral: true
+                });
+            }
+
+            currentConnection = joinVoiceChannel({
+                channelId: member.voice.channel.id,
+                guildId: interaction.guildId,
+                adapterCreator: interaction.guild.voiceAdapterCreator,
+            });
+
+            const channel = member.voice.channel;
+            if (!channel) {
+                await interaction.reply({ content: 'You must be in a voice channel to use this command.', ephemeral: true });
+                return;
+            }
+            // Store the channel name for file naming
+            currentChannelName = channel.name.replace(/[^a-zA-Z0-9-_]/g, '_'); // sanitize for filesystem
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            currentOutputPath = path.join(__dirname, `${currentChannelName}-${timestamp}.wav`);
+            
+            // Reset audio chunks array
+            audioChunks = [];
+            startTime = Date.now();
+            
+            const receiver = currentConnection.receiver;
+            const voiceChannel = member.voice.channel;
+            
+            // Subscribe to all members in the voice channel
+            for (const [memberId, member] of voiceChannel.members) {
+                if (!member.user.bot) {  // Don't record bot audio
+                    const stream = receiver.subscribe(memberId, { 
+                        end: { behavior: 'manual' }
+                    });
+                    
+                    const decoder = new Prism.opus.Decoder({ 
+                        frameSize: 960, 
+                        channels: CHANNELS, 
+                        rate: SAMPLE_RATE 
+                    });
+                    
+                    stream
+                        .pipe(decoder)
+                        .on('data', chunk => {
+                            if (isRecording) {
+                                audioChunks.push({
+                                    timestamp: Date.now() - startTime,
+                                    data: chunk
+                                });
+                            }
+                        });
+                    
+                    recordingStreams.set(memberId, stream);
+                }
+            }
+
+            // Set recording flag after all streams are set up
+            isRecording = true;
+
+            await interaction.reply({
+                content: 'Started recording all users in the voice channel! Use /stop to stop recording.',
+                ephemeral: true
+            });
+
+            currentConnection.on(VoiceConnectionStatus.Disconnected, async () => {
+                try {
+                    await Promise.race([
+                        entersState(currentConnection, VoiceConnectionStatus.Signalling, 5_000),
+                        entersState(currentConnection, VoiceConnectionStatus.Connecting, 5_000),
+                    ]);
+                } catch (error) {
+                    currentConnection.destroy();
+                }
+            });
         }
-      }
+
+        if (commandName === 'stop') {
+            if (!isRecording) {
+                return interaction.reply({
+                    content: 'No recording in progress!',
+                    ephemeral: true
+                });
+            }
+
+            // Defer the reply since the upload might take some time
+            await interaction.deferReply();
+
+            // Stop all recording streams
+            for (const [memberId, stream] of recordingStreams) {
+                stream.destroy();
+            }
+            recordingStreams.clear();
+
+            try {
+                // Save the WAV file and upload to Fireflies
+                const uploadResult = await saveWavFile();
+                
+                await interaction.editReply({
+                    content: `Recording stopped! The file has been saved and uploaded to Fireflies.ai.`,
+                    ephemeral: true
+                });
+            } catch (error) {
+                console.error('Failed to upload to Fireflies:', error);
+                await interaction.editReply({
+                    content: 'Recording stopped, but there was an error uploading to Fireflies.ai. The file has been saved locally.',
+                    ephemeral: true
+                });
+            }
+
+            if (currentConnection) {
+                currentConnection.destroy();
+                currentConnection = null;
+            }
+        }
     } catch (error) {
-      console.error(`[SESSION] Error saving final session:`, error);
+        console.error('Error handling interaction:', error);
+        await interaction.reply({
+            content: 'An error occurred while processing your command.',
+            ephemeral: true
+        });
     }
-    
-    recordingSession = null;
-  }
+});
+
+client.on('voiceStateUpdate', (oldState, newState) => {
+    // Ignore if the state change is not in our recording channel
+    if (!currentConnection || oldState.channelId !== currentConnection.joinConfig.channelId && newState.channelId !== currentConnection.joinConfig.channelId) {
+        return;
+    }
+
+    // User joined the channel
+    if (!oldState.channelId && newState.channelId) {
+        if (!newState.member.user.bot) {  // Don't add bots
+            currentParticipants.add(newState.member);
+            console.log(`${newState.member.user.username} joined the voice channel`);
+        }
+    }
+    // User left the channel
+    else if (oldState.channelId && !newState.channelId) {
+        if (!oldState.member.user.bot) {  // Don't remove bots
+            currentParticipants.delete(oldState.member);
+            console.log(`${oldState.member.user.username} left the voice channel`);
+        }
+    }
 });
 
 client.login(process.env.DISCORD_TOKEN);
+
